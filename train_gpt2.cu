@@ -10,6 +10,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <unistd.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <time.h> // Include for srand
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -630,6 +631,76 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
 
+void allocate_empty_gpt2(GPT2 *model) {
+    // Initialize config to default values
+    model->config.max_seq_len = 1024;
+    model->config.vocab_size = 50527;
+    model->config.num_layers = 12;
+    model->config.num_heads = 12;
+    model->config.channels = 768;
+
+    // Allocate space for all the parameters and calculate the number of parameters
+    int V = model->config.vocab_size;
+    int maxT = model->config.max_seq_len;
+    int L = model->config.num_layers;
+    int C = model->config.channels;
+
+    model->param_sizes[0] = V * C;
+    model->param_sizes[1] = maxT * C;
+    model->param_sizes[2] = L * C;
+    model->param_sizes[3] = L * C;
+    model->param_sizes[4] = L * (3 * C) * C;
+    model->param_sizes[5] = L * (3 * C);
+    model->param_sizes[6] = L * C * C;
+    model->param_sizes[7] = L * C;
+    model->param_sizes[8] = L * C;
+    model->param_sizes[9] = L * C;
+    model->param_sizes[10] = L * (4 * C) * C;
+    model->param_sizes[11] = L * (4 * C);
+    model->param_sizes[12] = L * C * (4 * C);
+    model->param_sizes[13] = L * C;
+    model->param_sizes[14] = C;
+    model->param_sizes[15] = C;
+
+    // Count the number of parameters
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        num_parameters += model->param_sizes[i];
+    }
+    printf("num_parameters: %zu\n", num_parameters);
+    model->num_parameters = num_parameters;
+
+    // Allocate device memory for parameters
+    cudaCheck(cudaMalloc(&model->params_memory, num_parameters * sizeof(float)));
+
+    // Initialize parameters randomly on the host
+    float *params_host = (float *)malloc(num_parameters * sizeof(float));
+    srand(time(NULL)); // Seed random number generator
+    for (size_t i = 0; i < num_parameters; i++) {
+        params_host[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f; // Random value between -1 and 1
+    }
+
+    // Copy parameters from host to device
+    cudaCheck(cudaMemcpy(model->params_memory, params_host, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Free host memory for parameters
+    free(params_host);
+
+    // Set all pointers to NULL
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->acts_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+
+    // Set num_activations to zero
+    model->num_activations = 0;
+
+    // Initialize mean_loss to -1.0f
+    model->mean_loss = -1.0f;
+}
 
 void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
 
@@ -980,7 +1051,8 @@ int main() {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    //gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    allocate_empty_gpt2(&model);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     char* tiny_stories_train = "data/TinyStories_train.bin";
