@@ -680,6 +680,8 @@ void allocate_empty_gpt2(GPT2 *model) {
         params_host[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f; // Random value between -1 and 1
     }
 
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
+
     // Copy parameters from host to device
     cudaCheck(cudaMemcpy(model->params_memory, params_host, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
 
