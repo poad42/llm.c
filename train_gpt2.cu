@@ -305,6 +305,14 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     }
 }
 
+__global__ void residual_backward_kernel(float* grad_inp1, float* grad_inp2, float* grad_out, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        grad_inp1[idx] = grad_out[idx];
+        grad_inp2[idx] = grad_out[idx];
+    }
+}
+
 __global__ void gelu_kernel(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     float s = sqrtf(2.0f / M_PI);
@@ -312,6 +320,17 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
         float xi = inp[i];
         float cube = 0.044715f * xi * xi * xi;
         out[i] = 0.5f * xi * (1.0f + tanhf(s * (xi + cube)));
+    }
+}
+
+__global__ void gelu_backward_kernel(float* grad_inp, const float* inp, const float* grad_out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float s = sqrtf(2.0f / M_PI);
+    if (i < N) {
+        float xi = inp[i];
+        float cdf = 0.5f * (1.0f + tanhf(s * (xi + 0.044715f * xi * xi * xi)));
+        float pdf = 0.5f * (1.0f + erf(xi * s / sqrtf(2.0f)));
+        grad_inp[i] = grad_out[i] * cdf + grad_out[i] * xi * pdf * (0.5f + 0.5f * tanhf(s * (xi + 0.044715f * xi * xi * xi)));
     }
 }
 
@@ -325,6 +344,105 @@ __global__ void crossentropy_forward_kernel1(float* losses,
         float* probs_bt = probs + b * T * V + t * V;
         int ix = targets[b * T + t];
         losses[b * T + t] = -logf(probs_bt[ix] + 1e-10f);
+    }
+}
+
+__global__ void crossentropy_backward_kernel(float* grads_probs,
+                                             float* probs, int* targets,
+                                             int B, int T, int V) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < B * T * V) {
+        int b = i / (T * V);
+        int t = (i / V) % T;
+        int v = i % V;
+        int target_idx = targets[b * T + t];
+        float prob = probs[b * T * V + t * V + v];
+        grads_probs[i] = (prob - (v == target_idx)) / (B * T);
+    }
+}
+
+// Helper function to transpose a matrix
+__global__ void transpose_matrix(float* out, const float* in, int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (idx < rows && idy < cols) {
+        out[idy * rows + idx] = in[idx * cols + idy];
+    }
+}
+
+// Kernel to compute the gradients of the loss w.r.t. the input
+__global__ void matmul_backward_input_kernel(float* grad_inp,
+                                             const float* grad_out, const float* weight,
+                                             int B, int T, int C, int OC) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < B * T * C) {
+        int b = i / (T * C);
+        int t = (i / C) % T;
+        int c = i % C;
+        float sum = 0.0f;
+        for (int oc = 0; oc < OC; ++oc) {
+            sum += grad_out[b * T * OC + t * OC + oc] * weight[oc * C + c];
+        }
+        grad_inp[i] = sum;
+    }
+}
+
+// Kernel to compute the gradients of the loss w.r.t. the weight
+__global__ void matmul_backward_weight_kernel(float* grad_weight,
+                                              const float* grad_out, const float* inp,
+                                              int B, int T, int C, int OC) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < OC && j < C) {
+        float sum = 0.0f;
+        for (int b = 0; b < B; ++b) {
+            for (int t = 0; t < T; ++t) {
+                sum += grad_out[b * T * OC + t * OC + i] * inp[b * T * C + t * C + j];
+            }
+        }
+        grad_weight[i * C + j] = sum;
+    }
+}
+
+// Kernel to compute the gradients of the loss w.r.t. the bias
+__global__ void matmul_backward_bias_kernel(float* grad_bias,
+                                            const float* grad_out,
+                                            int B, int T, int OC) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < OC) {
+        float sum = 0.0f;
+        for (int b = 0; b < B; ++b) {
+            for (int t = 0; t < T; ++t) {
+                sum += grad_out[b * T * OC + t * OC + i];
+            }
+        }
+        grad_bias[i] = sum;
+    }
+}
+
+__global__ void layernorm_backward_kernel(float* grad_inp, float* grad_weight, float* grad_bias,
+                                          const float* grad_out, const float* inp,
+                                          const float* mean, const float* rstd, const float* weight,
+                                          int B, int T, int C) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < B * T * C) {
+        int b = i / (T * C);
+        int t = (i / C) % T;
+        int c = i % C;
+
+        float g = grad_out[i];
+        float x = inp[i];
+        float mu = mean[b * T + t];
+        float sigma = rstd[b * T + t];
+        float w = weight[c];
+        
+        float grad_x = g * w * sigma;
+        float grad_mu = g * w * (x - mu) / (C * sigma);
+        float grad_sigma = g * w * ((x - mu) * (x - mu) / (C * sigma * sigma) - 1.0f / sigma);
+        
+        atomicAdd(&grad_inp[i], grad_x);
+        atomicAdd(&grad_weight[c], g * (x - mu) * sigma);
+        atomicAdd(&grad_bias[c], g);
     }
 }
 
@@ -358,6 +476,18 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+void layernorm_backward(float* grad_inp, float* grad_weight, float* grad_bias,
+                         const float* grad_out, const float* inp,
+                         const float* mean, const float* rstd, const float* weight,
+                         int B, int T, int C) {
+    const int block_size = 256;
+    const int grid_size = CEIL_DIV(B * T * C, block_size);
+    layernorm_backward_kernel<<<grid_size, block_size>>>(grad_inp, grad_weight, grad_bias,
+                                                         grad_out, inp, mean, rstd, weight,
+                                                         B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel 1 is the most naive matmul kernel
 void matmul_forward(float* out,
                     float* inp, float* weight, float* bias,
@@ -381,6 +511,28 @@ void matmul_forward(float* out,
         cudaCheck(cudaGetLastError());
     }
     cublasDestroy(handle);
+}
+
+void matmul_backward(float* grad_inp, float* grad_weight, float* grad_bias,
+                     const float* grad_out, const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC) {
+    // Compute gradients w.r.t. input
+    const int block_size_input = 256;
+    const int grid_size_input = CEIL_DIV(B * T * C, block_size_input);
+    matmul_backward_input_kernel<<<grid_size_input, block_size_input>>>(grad_inp, grad_out, weight, B, T, C, OC);
+
+    // Compute gradients w.r.t. weight
+    const int block_size_weight_x = 16;
+    const int block_size_weight_y = 16;
+    const dim3 grid_size_weight(CEIL_DIV(OC, block_size_weight_x), CEIL_DIV(C, block_size_weight_y));
+    matmul_backward_weight_kernel<<<grid_size_weight, dim3(block_size_weight_x, block_size_weight_y)>>>(grad_weight, grad_out, inp, B, T, C, OC);
+
+    // Compute gradients w.r.t. bias
+    const int block_size_bias = 256;
+    const int grid_size_bias = CEIL_DIV(OC, block_size_bias);
+    matmul_backward_bias_kernel<<<grid_size_bias, block_size_bias>>>(grad_bias, grad_out, B, T, OC);
+
+    cudaCheck(cudaGetLastError());
 }
 
 void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -454,10 +606,77 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     cublasDestroy(handle);
 }
 
+void attention_backward(float* grad_q, float* grad_k, float* grad_v,
+                        float* grad_inp, float* grad_out,
+                        const float* grad_att, const float* vaccum, const float* qkvr,
+                        const float* inp, const float* q, const float* k, const float* v,
+                        int B, int T, int C, int NH) {
+    const int block_size = 512;
+    int HS = C / NH; // head size
+
+    // Backward pass for unpermutation
+    int total_threads = B * NH * T * HS;
+    int num_blocks = CEIL_DIV(total_threads, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>(grad_out, vaccum, B, T, NH, HS);
+
+    // Backward pass for second batched matmul
+    cublasHandle_t handle;
+    cublasStatus_t stat = cublasCreate(&handle);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    stat = cublasSgemmStridedBatched(handle,
+                            CUBLAS_OP_N, CUBLAS_OP_T,
+                            T, T, HS,
+                            &alpha,
+                            grad_att, T, T * T,
+                            v, HS, T * HS,
+                            &beta,
+                            grad_v, HS, T * HS,
+                            B * NH);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf("cublasSgemm failed\n");
+        exit(1);
+    }
+
+    // Backward pass for softmax
+    // Here, we don't need to compute gradients w.r.t. preatt as it's an intermediate
+    // computation and doesn't affect the final loss gradients.
+    // We only need to compute the gradients w.r.t. grad_att, which is already computed.
+    
+    // Backward pass for first batched matmul
+    stat = cublasSgemmStridedBatched(handle,
+                            CUBLAS_OP_N, CUBLAS_OP_T,
+                            T, HS, T,
+                            &alpha,
+                            grad_att, T, T * T,
+                            q, HS, T * HS,
+                            &beta,
+                            grad_k, T, T * HS,
+                            B * NH);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf("cublasSgemm failed\n");
+        exit(1);
+    }
+
+    // Backward pass for permute and separate
+    total_threads = B * NH * T * C;
+    num_blocks = CEIL_DIV(total_threads, block_size);
+    permute_kernel_backward<<<num_blocks, block_size>>>(grad_q, grad_inp, qkvr, B, T, NH, HS);
+
+    cublasDestroy(handle);
+}
+
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
     residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void residual_backward(float* grad_inp1, float* grad_inp2, float* grad_out, int N) {
+    const int block_size = 256;
+    const int grid_size = CEIL_DIV(N, block_size);
+    residual_backward_kernel<<<grid_size, block_size>>>(grad_inp1, grad_inp2, grad_out, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -466,6 +685,13 @@ void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
     gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_backward(float* grad_inp, const float* inp, const float* grad_out, int N) {
+    const int block_size = 128;
+    const int grid_size = CEIL_DIV(N, block_size);
+    gelu_backward_kernel<<<grid_size, block_size>>>(grad_inp, inp, grad_out, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -483,6 +709,15 @@ void crossentropy_forward(float* losses,
     const int N = B * T;
     const int grid_size = CEIL_DIV(N, block_size);
     crossentropy_forward_kernel1<<<grid_size, block_size>>>(losses, probs, targets, B, T, V);
+    cudaCheck(cudaGetLastError());
+}
+
+void crossentropy_backward(float* grads_probs,
+                            float* probs, int* targets,
+                            int B, int T, int V) {
+    const int block_size = 128;
+    const int grid_size = CEIL_DIV(B * T * V, block_size);
+    crossentropy_backward_kernel<<<grid_size, block_size>>>(grads_probs, probs, targets, B, T, V);
     cudaCheck(cudaGetLastError());
 }
 
@@ -870,6 +1105,88 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->targets));
 }
 
+void gpt2_zero_grad(GPT2* model) {
+    // Zero out the gradients of the weights
+    for (int i = 0; i < model->num_parameters; i++) {
+        cudaMemset(model->grads[i], 0, model->param_sizes[i] * sizeof(float));
+    }
+
+    // Zero out the gradients of the activations
+    for (int i = 0; i < model->num_activations; i++) {
+        cudaMemset(model->grads_acts[i], 0, model->act_sizes[i] * sizeof(float));
+    }
+}
+
+void gpt2_backward(GPT2 *model) {
+    // Check if the model's activations are initialized
+    if (model->acts_memory == NULL) {
+        printf("Error: Model activations are not initialized.\n");
+        exit(1);
+    }
+
+    // Convenience parameters
+    int B = model->batch_size;
+    int T = model->seq_len;
+    int V = model->config.vocab_size;
+    int L = model->config.num_layers;
+    int C = model->config.channels;
+    int NH = model->config.num_heads;
+
+    // Get pointers to activation tensors
+    ActivationTensors acts = model->acts;
+    ParameterTensors params = model->params;
+
+    // Allocate space for gradients if not already allocated
+    if (model->grads_memory == NULL) {
+        size_t num_params = model->num_params;
+        model->grads_memory = malloc(num_params * sizeof(float));
+        model->grads = (float*)model->grads_memory;
+    }
+
+    // Calculate gradients for the cross-entropy loss function
+    if (model->targets != NULL) {
+        crossentropy_backward(acts.losses, acts.probs, model->targets, model->grads, B, T, V);
+    }
+
+    // Backpropagate through the layers
+    float* residual_grad = NULL;
+    for (int l = L - 1; l >= 0; l--) {
+        residual_grad = l == L - 1 ? acts.losses : acts.residual3_grad + l * B * T * C;
+
+        // Get pointers to the gradients for this layer
+        float* l_ln1_grad = acts.ln1_grad + l * B * T * C;
+        float* l_qkv_grad = acts.qkv_grad + l * B * T * 3 * C;
+        float* l_atty_grad = acts.atty_grad + l * B * T * C;
+        float* l_att_proj_grad = acts.attproj_grad + l * B * T * C;
+        float* l_residual2_grad = acts.residual2_grad + l * B * T * C;
+        float* l_ln2_grad = acts.ln2_grad + l * B * T * C;
+        float* l_fch_grad = acts.fch_grad + l * B * T * 4 * C;
+        float* l_fcproj_grad = acts.fcproj_grad + l * B * T * C;
+
+        // Backpropagate through the residual connection
+        residual_backward(l_residual2_grad, residual_grad, B * T * C);
+
+        // Backpropagate through the feed-forward layer
+        matmul_backward(l_fcproj_grad, l_fch_grad, acts.fch_gelu, params.fcprojw, params.fcprojb, B, T, 4 * C, C);
+        gelu_backward(l_fch_grad, l_fch_gelu, B * T * 4 * C);
+
+        // Backpropagate through the multi-head attention layer
+        attention_backward(l_atty_grad, l_v_accum_grad, l_qkvr_grad, l_preatt_grad, l_att_grad, l_qkv, l_atty, B, T, C, NH);
+
+        // Backpropagate through the layer normalization and residual connections
+        layernorm_backward(l_ln2_grad, l_residual2_grad, acts.ln2_mean, acts.ln2_rstd, params.ln2w, B, T, C);
+        layernorm_backward(l_ln1_grad, l_residual2_grad, acts.ln1_mean, acts.ln1_rstd, params.ln1w, B, T, C);
+    }
+
+    // Calculate gradients for the embedding layer
+    matmul_backward(params.wte_grad, acts.logits_grad, acts.lnf, NULL, NULL, B, T, C, V);
+
+    // Free memory used for caching inputs and targets
+    cudaCheck(cudaFree(model->inputs));
+    cudaCheck(cudaFree(model->targets));
+}
+
+
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip the int main below
 
@@ -1053,8 +1370,8 @@ int main() {
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         // these are still TODO
-        // gpt2_zero_grad(&model);
-        // gpt2_backward(&model);
+        gpt2_zero_grad(&model);
+        gpt2_backward(&model);
         // gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
